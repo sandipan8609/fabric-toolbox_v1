@@ -108,9 +108,9 @@ The services layer contains all business logic modules. Each service is responsi
 
 **Key Features**:
 - 3 regex patterns for detecting global parameters:
-  - Standard: `@pipeline().globalParameters.X`
-  - Curly-brace: `@{pipeline().globalParameters.X}`
-  - Function-wrapped: `pipeline().globalParameters.X`
+  - Standard: `@pipeline().globalParameters.X` - Direct reference in expressions
+  - Curly-brace: `@{pipeline().globalParameters.X}` - Expression-wrapped format
+  - Nested/Function-wrapped: `pipeline().globalParameters.X` (without `@` prefix) - Detects parameters inside functions like `@string(pipeline().globalParameters.X)`
 - Type mapping from ADF to Fabric
 - Pipeline usage tracking
 
@@ -472,7 +472,7 @@ The services layer contains all business logic modules. Each service is responsi
 - Schedule trigger conversion
 - Recurrence mapping
 - Multi-pipeline schedule handling
-- Disabled deployment by default (safety)
+- Schedules deploy with `enabled: false` by default (safety measure to allow testing before activation)
 
 ---
 
@@ -586,8 +586,8 @@ The wizard pages guide users through the migration process.
 |------|------|-------------|
 | `UploadPage.tsx` | 0 | ARM template upload and profiling (no login required) |
 | `LoginPage.tsx` | 1 | Azure AD authentication |
-| `WorkspacePage.tsx` | 2 | Fabric workspace selection |
-| `WorkspaceSelectionPage.tsx` | 2 (alt) | Alternative workspace selection view |
+| `WorkspacePage.tsx` | 2 | Fabric workspace selection (primary page) |
+| `WorkspaceSelectionPage.tsx` | 2 | Alternative workspace selection UI (legacy/simplified view, may be used in specific flows) |
 | `ManagedIdentityPage.tsx` | 3 | Managed Identity to Workspace Identity mapping |
 | `LinkedServiceConnectionPage.tsx` | 4 | Connection configuration for LinkedServices |
 | `EnhancedLinkedServiceConnectionPage.tsx` | 4 (enhanced) | Enhanced connection configuration UI |
@@ -1010,11 +1010,12 @@ Navigation follows strict step validation:
 - Steps can be conditional (e.g., global parameters)
 
 ### 5. Expression Transformation
-Global parameter expressions are transformed:
+Global parameter expressions are transformed to reference the deployed Variable Library:
 ```
 @pipeline().globalParameters.X 
-  → @pipeline().libraryVariables.LibName_VariableLibrary_X
+  → @pipeline().libraryVariables.{LibraryName}_VariableLibrary_X
 ```
+Where `{LibraryName}` is the user-configured Variable Library display name (e.g., `MyFactory_GlobalParameters`).
 
 ---
 
