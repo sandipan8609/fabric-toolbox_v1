@@ -11,60 +11,84 @@ from copy import deepcopy
 CONFIG = {
     "workspace_id": "95e132cd-cf5f-4e15-a9e1-7506994aa23c",
     "notebook_id": "your_fabric_notebook_id",
-    
-    # Connections
+
+    # Connections (GUIDs from your tenant)
     "warehouse_connection_id": "06f15094-5415-40ca-9647-985fa72a41fe",
     "lakehouse_connection_id": "e31de1f3-905a-400e-8c21-1bfcc5c7719c",
     "oracle_connection_id": "1320ffbd-c314-4267-be68-d3e63f7ff4df",
-    
+
     # Artifacts
     "warehouse_artifact_id": "6068bf54-5806-44df-996b-f19fac38d18c",
     "warehouse_endpoint": "uz5qo3w55cyebj7ffmgl7aydcm-zuzodfk7z4ku5kpboudjssvchq.datawarehouse.fabric.microsoft.com",
     "lakehouse_artifact_id": "2d07daef-8c0b-454d-9a31-28faec11c440",
     "lakehouse_name": "lh_sbm_bronze_dev",
 
-    # Optional: choose sink target for Copy activity ("blob" or "lakehouse")
-    "target_sink": "lakehouse"  # change to "blob" if you want Blob as the output target
+    # Copy sink selection: "lakehouse" | "blob" | "blobfs"
+    # - lakehouse -> LakehouseWriteSettings
+    # - blob      -> AzureBlobStorageWriteSettings
+    # - blobfs    -> AzureBlobFSWriteSettings (ADLS Gen2 style)
+    "target_sink": "lakehouse",
+
+    # Parameter candidates to support multiple pipeline conventions
+    "param_candidates": {
+        "source_container": ["containerName", "blob_container"],
+        "sink_folder": ["destinationPath", "blob_path"],
+        "sink_file": ["fileName", "file_name"]
+    }
 }
 
 # ==========================================
-# 2. DATA FLATTENING HELPERS
+# 2. HELPERS
 # ==========================================
 
 def clean_val(val):
-    """Sanitizes input values."""
+    """Sanitizes input values (surface suspicious markers)."""
     if str(val) == "[object Object]":
         return "FIX_ME_INVALID_OBJECT"
     return val
 
 def get_flat_value(val):
     """
-    Recursively drills down to get the raw primitive value (str/int/bool).
-    Strips away any existing wrappers so we can re-format correctly.
+    Recursively unwrap ADF shapes to plain values.
+    Dicts without 'value' -> JSON string for deterministic behavior.
     """
     if isinstance(val, dict):
         if "value" in val:
             return get_flat_value(val["value"])
-        # Safer fallback: deterministic JSON for dicts without 'value'
         return json.dumps(val, ensure_ascii=False)
     if val is None:
         return ""
     return clean_val(val)
 
 def is_expression(val):
-    # Robust: expressions are strings that start with @ or = after trimming
     return isinstance(val, str) and val.strip().startswith(("@", "="))
 
+def expr_param(name):
+    """Build a Fabric expression wrapper for pipeline().parameters.<name>"""
+    return {"value": f"@pipeline().parameters.{name}", "type": "Expression"}
+
+def select_param_name(pipeline_props, key):
+    """
+    Pick the first available parameter name from candidates in CONFIG['param_candidates'][key].
+    pipeline_props: the full 'properties' object from the pipeline (has 'parameters')
+    """
+    candidates = CONFIG["param_candidates"].get(key, [])
+    params = (pipeline_props or {}).get("parameters", {}) or {}
+    for c in candidates:
+        if c in params:
+            return c
+    # Fallback to first candidate even if not present (expression will still be valid syntactically)
+    return candidates[0] if candidates else None
+
 # ==========================================
-# 3. FORMATTERS
+# 3. FORMATTERS (Exact Fabric shapes)
 # ==========================================
 
 def format_sp_param(val):
     """
-    Stored Proc Parameters (Fabric):
-    - Expression: { "value": { "value": "@...", "type": "Expression" }, "type": "String" }
-    - Literal:    { "value": { "value": "...",  "type": "String"     }, "type": "String" }
-    Matches the reference block provided by you.
+    Stored Proc Parameters (Fabric as per your reference):
+    - Outer type always "String"
+    - Inner { "value": <raw>, "type": "Expression" | "String" }
     """
     raw = get_flat_value(val)
     return {
@@ -77,8 +101,7 @@ def format_sp_param(val):
 
 def format_notebook_param(val):
     """
-    Notebook Parameters: Strict Double Nesting
-    { "value": { "value": "...", "type": "..." }, "type": "Expression" }
+    Notebook Parameters: double-nested, outer type=Expression; inner toggles.
     """
     raw = get_flat_value(val)
     return {
@@ -90,54 +113,37 @@ def format_notebook_param(val):
     }
 
 def format_invoke_param(val):
-    """
-    InvokePipeline Parameters: Conditional Nesting
-    Expression -> double nested, outer type Expression
-    Literal    -> single nested, type String
-    """
+    """InvokePipeline params: expressions double-nested, literals single."""
     raw = get_flat_value(val)
     if is_expression(raw):
-        return {
-            "value": {
-                "value": raw,
-                "type": "Expression"
-            },
-            "type": "Expression"
-        }
+        return {"value": {"value": raw, "type": "Expression"}, "type": "Expression"}
     else:
-        return {
-            "value": raw,
-            "type": "String"
-        }
+        return {"value": raw, "type": "String"}
+
+def format_generic_value(val):
+    """Utility to preserve Expression/Literal with single nesting (non-SP contexts)."""
+    raw = get_flat_value(val)
+    return {"value": raw, "type": "Expression" if is_expression(raw) else "String"}
 
 # ==========================================
 # 4. CONVERTERS
 # ==========================================
 
 def convert_stored_proc(act):
-    """
-    Convert ADF SqlServerStoredProcedure to Fabric shape
-    - storedProcedureName: raw string
-    - storedProcedureParameters: per format_sp_param (outer String, inner Expression/String)
-    - connectionSettings: Warehouse; no top-level externalReferences
-    """
+    # To match your Fabric reference block exactly
     new_act = _base_props(act, "SqlServerStoredProcedure")
-    tp_old = act.get("typeProperties", {})
+    tp_old = act.get("typeProperties", {}) or {}
 
-    # Name MUST be a raw string (no wrapper)
     sp_name_raw = get_flat_value(tp_old.get("storedProcedureName", ""))
 
-    # Build typeProperties in the Fabric shape
     new_act["typeProperties"] = {
         "storedProcedureName": sp_name_raw,
         "storedProcedureParameters": {}
     }
 
-    # Parameters: always outer String, inner Expression/String
     for k, v in tp_old.get("storedProcedureParameters", {}).items():
         new_act["typeProperties"]["storedProcedureParameters"][k] = format_sp_param(v)
 
-    # Warehouse connectionSettings (matches your reference)
     new_act["connectionSettings"] = {
         "name": "wh_sbm_gold",
         "properties": {
@@ -148,18 +154,14 @@ def convert_stored_proc(act):
                 "artifactId": CONFIG["warehouse_artifact_id"],
                 "workspaceId": CONFIG["workspace_id"]
             },
-            "externalReferences": {
-                "connection": CONFIG["warehouse_connection_id"]
-            }
+            "externalReferences": {"connection": CONFIG["warehouse_connection_id"]}
         }
     }
-
-    # No top-level externalReferences per your reference
     return new_act
 
 def convert_invoke_pipeline(act):
     new_act = _base_props(act, "InvokePipeline")
-    tp_old = act.get("typeProperties", {})
+    tp_old = act.get("typeProperties", {}) or {}
 
     new_act["typeProperties"] = {
         "waitOnCompletion": tp_old.get("waitOnCompletion", True),
@@ -170,57 +172,97 @@ def convert_invoke_pipeline(act):
     }
     for k, v in tp_old.get("parameters", {}).items():
         new_act["typeProperties"]["parameters"][k] = format_invoke_param(v)
-
-    # If your tenant expects a pipeline credential/connection, set it here; otherwise omit.
     return new_act
 
 def convert_notebook(act):
     new_act = _base_props(act, "TridentNotebook")
-    tp_old = act.get("typeProperties", {})
+    tp_old = act.get("typeProperties", {}) or {}
 
     new_act["typeProperties"] = {
         "notebookId": tp_old.get("notebookId", CONFIG["notebook_id"]),
         "workspaceId": CONFIG["workspace_id"],
         "parameters": {}
     }
-    # Handle parameter source location (ADF uses baseParameters)
     base_params = tp_old.get("baseParameters", {}) or tp_old.get("parameters", {})
     for k, v in base_params.items():
         new_act["typeProperties"]["parameters"][k] = format_notebook_param(v)
-
     return new_act
 
-def _build_blob_sink():
-    """Blob sink using pipeline parameters 'blob_path' and 'file_name' (ADF-style)."""
+def _build_sink(folder_param_name, file_param_name):
+    """
+    Build sink block based on CONFIG['target_sink'] and selected parameter names.
+    - folder_param_name: e.g., destinationPath or blob_path
+    - file_param_name:   e.g., fileName or file_name
+    """
+    target = CONFIG.get("target_sink", "lakehouse").lower()
+
+    if target == "lakehouse":
+        return {
+            "type": "DelimitedTextSink",
+            "storeSettings": {"type": "LakehouseWriteSettings"},
+            "formatSettings": {
+                "type": "DelimitedTextWriteSettings",
+                "quoteAllText": True,
+                "fileExtension": ".TXT"
+            },
+            "datasetSettings": {
+                "type": "DelimitedText",
+                "connectionSettings": {
+                    "name": CONFIG["lakehouse_name"],
+                    "properties": {
+                        "type": "Lakehouse",
+                        "typeProperties": {
+                            "workspaceId": CONFIG["workspace_id"],
+                            "artifactId": CONFIG["lakehouse_artifact_id"],
+                            "rootFolder": "Files"
+                        },
+                        "externalReferences": {"connection": CONFIG["lakehouse_connection_id"]}
+                    }
+                },
+                "typeProperties": {
+                    "location": {
+                        "type": "LakehouseLocation",
+                        "folderPath": expr_param(folder_param_name),
+                        "fileName": expr_param(file_param_name)
+                    },
+                    "columnDelimiter": "|",
+                    "escapeChar": "\\",
+                    "firstRowAsHeader": True,
+                    "quoteChar": ""
+                }
+            }
+        }
+
+    if target == "blobfs":
+        # ADLS Gen2-style sink
+        return {
+            "type": "DelimitedTextSink",
+            "storeSettings": {"type": "AzureBlobFSWriteSettings"},
+            "formatSettings": {
+                "type": "DelimitedTextWriteSettings",
+                "quoteAllText": True,
+                "fileExtension": ".TXT"
+            },
+            "datasetSettings": {
+                "type": "DelimitedText",
+                "typeProperties": {
+                    "location": {
+                        "type": "AzureBlobFSLocation",
+                        "folderPath": expr_param(folder_param_name),
+                        "fileName": expr_param(file_param_name)
+                    },
+                    "columnDelimiter": "|",
+                    "escapeChar": "\\",
+                    "firstRowAsHeader": True,
+                    "quoteChar": ""
+                }
+            }
+        }
+
+    # Default: blob
     return {
         "type": "DelimitedTextSink",
         "storeSettings": {"type": "AzureBlobStorageWriteSettings"},
-        "formatSettings": {
-            "type": "DelimitedTextWriteSettings",
-            "quoteAllText": True,
-            "fileExtension": ".TXT"   # match your uppercase convention
-        },
-        "datasetSettings": {
-            "type": "DelimitedText",
-            "typeProperties": {
-                "location": {
-                    "type": "AzureBlobStorageLocation",
-                    "folderPath": {"value": "@pipeline().parameters.blob_path", "type": "Expression"},
-                    "fileName": {"value": "@pipeline().parameters.file_name", "type": "Expression"}
-                },
-                "columnDelimiter": "|",
-                "escapeChar": "\\",
-                "firstRowAsHeader": True,
-                "quoteChar": ""
-            }
-        }
-    }
-
-def _build_lakehouse_sink():
-    """Lakehouse sink mapping existing parameters 'blob_path' and 'file_name' to Files/ location."""
-    return {
-        "type": "DelimitedTextSink",
-        "storeSettings": {"type": "LakehouseWriteSettings"},
         "formatSettings": {
             "type": "DelimitedTextWriteSettings",
             "quoteAllText": True,
@@ -228,23 +270,11 @@ def _build_lakehouse_sink():
         },
         "datasetSettings": {
             "type": "DelimitedText",
-            "connectionSettings": {
-                "name": CONFIG["lakehouse_name"],
-                "properties": {
-                    "type": "Lakehouse",
-                    "typeProperties": {
-                        "workspaceId": CONFIG["workspace_id"],
-                        "artifactId": CONFIG["lakehouse_artifact_id"],
-                        "rootFolder": "Files"
-                    },
-                    "externalReferences": {"connection": CONFIG["lakehouse_connection_id"]}
-                }
-            },
             "typeProperties": {
                 "location": {
-                    "type": "LakehouseLocation",
-                    "folderPath": {"value": "@pipeline().parameters.blob_path", "type": "Expression"},
-                    "fileName": {"value": "@pipeline().parameters.file_name", "type": "Expression"}
+                    "type": "AzureBlobStorageLocation",
+                    "folderPath": expr_param(folder_param_name),
+                    "fileName": expr_param(file_param_name)
                 },
                 "columnDelimiter": "|",
                 "escapeChar": "\\",
@@ -254,19 +284,22 @@ def _build_lakehouse_sink():
         }
     }
 
-def convert_copy(act):
+def convert_copy(act, pipeline_props=None):
     """
     Copy:
-    - Source: OracleSource gets datasetSettings with Oracle connection and wraps oracleReaderQuery as Expression
-    - Sink: choose Blob or Lakehouse via CONFIG["target_sink"]; parameters mapped to existing pipeline ones
+    - Source: handle OracleSource OR DelimitedTextSource (Blob read)
+    - Sink: select via CONFIG['target_sink'] and map folder/file params detected from pipeline
+    - Preserve translator if present
     """
     new_act = _base_props(act, "Copy")
-    tp_old = act.get("typeProperties", {})
+    tp_old = act.get("typeProperties", {}) or {}
     source = tp_old.get("source", {}) or {}
     new_source = deepcopy(source)
 
-    # Source: Oracle → add datasetSettings with Oracle connection
-    if source.get("type") == "OracleSource":
+    # --- Source handling ---
+    stype = source.get("type")
+
+    if stype == "OracleSource":
         new_source["datasetSettings"] = {
             "annotations": [],
             "type": "OracleTable",
@@ -278,70 +311,85 @@ def convert_copy(act):
                 "value": get_flat_value(new_source["oracleReaderQuery"]),
                 "type": "Expression"
             }
-    else:
-        # Fallback: DelimitedText from Blob (if you have a blob connection id, set it here)
-        new_source["datasetSettings"] = {
-            "annotations": [],
-            "type": "DelimitedText",
-            "typeProperties": {
-                "location": {
-                    "type": "AzureBlobStorageLocation",
-                    "container": {"value": "@pipeline().parameters.blob_container", "type": "Expression"},
-                    "folderPath": {"value": "raw", "type": "String"}
-                },
-                "columnDelimiter": ",",
-                "escapeChar": "\\",
-                "firstRowAsHeader": True,
-                "quoteChar": "\""
-            },
-            # NOTE: Using Lakehouse connection here is not ideal for Blob.
-            # If you have a dedicated blob connection id, replace it below.
-            "externalReferences": {"connection": CONFIG["lakehouse_connection_id"]}
+
+    elif stype == "DelimitedTextSource":
+        # Map Blob read settings and expressions
+        # Detect container param name from pipeline properties
+        container_param = select_param_name(pipeline_props, "source_container") or "containerName"
+        new_source = {
+            "type": "DelimitedTextSource",
+            "storeSettings": {"type": "AzureBlobStorageReadSettings"},
+            "recursive": source.get("recursive", False),
+            # Wrap these as Expressions if they were expressions in ADF
+            "modifiedDatetimeStart": format_generic_value(source.get("modifiedDatetimeStart")),
+            "wildcardFileName": format_generic_value(source.get("wildcardFileName")),
+            "formatSettings": {"type": "DelimitedTextReadSettings"},
+            "datasetSettings": {
+                "annotations": [],
+                "type": "DelimitedText",
+                "typeProperties": {
+                    "location": {
+                        "type": "AzureBlobStorageLocation",
+                        "container": expr_param(container_param),
+                        # If you have folder path param, you can add it here. For ADF, it's often implicit via wildcard/fileName.
+                    }
+                }
+            }
         }
 
-    # Sink: choose based on CONFIG
-    new_sink = _build_lakehouse_sink() if CONFIG.get("target_sink") == "lakehouse" else _build_blob_sink()
+    else:
+        # Fallback to basic DelimitedText with Blob location (rare paths)
+        container_param = select_param_name(pipeline_props, "source_container") or "containerName"
+        new_source = {
+            "type": "DelimitedTextSource",
+            "storeSettings": {"type": "AzureBlobStorageReadSettings"},
+            "formatSettings": {"type": "DelimitedTextReadSettings"},
+            "datasetSettings": {
+                "annotations": [],
+                "type": "DelimitedText",
+                "typeProperties": {
+                    "location": {
+                        "type": "AzureBlobStorageLocation",
+                        "container": expr_param(container_param)
+                    }
+                }
+            }
+        }
+
+    # --- Sink handling ---
+    folder_param = select_param_name(pipeline_props, "sink_folder") or "destinationPath"
+    file_param = select_param_name(pipeline_props, "sink_file") or "fileName"
+    new_sink = _build_sink(folder_param, file_param)
 
     new_act["typeProperties"] = {
         "source": new_source,
         "sink": new_sink,
         "enableStaging": tp_old.get("enableStaging", False),
-        # Preserve translator if present
         "translator": deepcopy(tp_old.get("translator", {}))
     }
     return new_act
 
 def convert_lookup(act):
     """
-    Convert ADF Lookup to Fabric Lookup reading from Warehouse.
-    Handles common ADF patterns:
-      - source.sqlReaderQuery (SQL text)
-      - dataset-based Lookup (remove linkedServiceName; use Warehouse datasetSettings)
-      - rare storedProcedureName usage (mapped to sqlReaderQuery if present)
+    Lookup → Fabric Lookup reading from Warehouse.
+    Supports:
+      - source.sqlReaderQuery
+      - source.storedProcedureName (mapped to EXEC ...)
+      - source.query
     """
     new_act = _base_props(act, "Lookup")
     tp_old = act.get("typeProperties", {}) or {}
-
-    # ADF sometimes has source as a dict with sqlReaderQuery or table/query attributes
     src_old = tp_old.get("source", {}) or {}
 
-    # Determine the SQL to run:
-    # Priority: explicit sqlReaderQuery → storedProcedureName (call) → inline query field → empty
-    sql_expr = None
     if "sqlReaderQuery" in src_old:
         sql_expr = get_flat_value(src_old["sqlReaderQuery"])
     elif "storedProcedureName" in src_old:
-        # Map SP name to a callable expression if needed; commonly Fabric Lookup expects SQL.
-        # You may adjust this if you truly want to execute SP via Lookup (not typical).
-        spname = get_flat_value(src_old["storedProcedureName"])
-        # Minimal mapping: execute SP via T-SQL call pattern
-        sql_expr = f"EXEC {spname}"
+        sql_expr = f"EXEC {get_flat_value(src_old['storedProcedureName'])}"
     elif "query" in src_old:
         sql_expr = get_flat_value(src_old["query"])
     else:
-        sql_expr = ""  # no-op; safe default
+        sql_expr = ""
 
-    # Build Fabric Lookup typeProperties
     new_act["typeProperties"] = {
         "source": {
             "type": "DataWarehouseSource",
@@ -371,11 +419,72 @@ def convert_lookup(act):
             }
         }
     }
-
-    # ADF extras (firstRowOnly, etc.) → preserve if present
     if "firstRowOnly" in tp_old:
         new_act["typeProperties"]["firstRowOnly"] = tp_old["firstRowOnly"]
+    return new_act
 
+def convert_get_metadata(act, pipeline_props=None):
+    """
+    GetMetadata:
+    - Build datasetSettings for Blob (AzureBlobStorageReadSettings) with container param.
+    - Preserve fieldList, storeSettings, formatSettings if present.
+    """
+    new_act = _base_props(act, "GetMetadata")
+    tp_old = act.get("typeProperties", {}) or {}
+    dataset_old = tp_old.get("dataset", {}) or {}
+
+    container_param = select_param_name(pipeline_props, "source_container") or "containerName"
+
+    new_ds = {
+        "annotations": [],
+        "type": "DelimitedText",
+        "typeProperties": {
+            "location": {
+                "type": "AzureBlobStorageLocation",
+                "container": expr_param(container_param)
+            }
+        }
+    }
+
+    new_act["typeProperties"] = {
+        "datasetSettings": new_ds,
+        "fieldList": tp_old.get("fieldList", []),
+        "storeSettings": {"type": "AzureBlobStorageReadSettings"},
+        "formatSettings": {"type": "DelimitedTextReadSettings"}
+    }
+    return new_act
+
+def convert_set_variable(act):
+    """
+    SetVariable:
+    - Keep variableName
+    - Wrap value as Expression/String appropriately
+    """
+    new_act = _base_props(act, "SetVariable")
+    tp_old = act.get("typeProperties", {}) or {}
+    val = tp_old.get("value", {})
+    new_act["typeProperties"] = {
+        "variableName": tp_old.get("variableName", ""),
+        "value": format_generic_value(val)
+    }
+    return new_act
+
+def convert_for_each(act, pipeline_props=None):
+    """
+    ForEach:
+    - Preserve items (Expression or String)
+    - Recurse into inner activities
+    - isSequential preserved
+    """
+    new_act = _base_props(act, "ForEach")
+    tp_old = act.get("typeProperties", {}) or {}
+    items_old = tp_old.get("items")
+
+    new_act["typeProperties"] = {
+        "items": format_generic_value(items_old),
+        "isSequential": tp_old.get("isSequential", True),
+        "activities": convert_activity_list(tp_old.get("activities", []), pipeline_props)
+    }
     return new_act
 
 # ==========================================
@@ -391,7 +500,7 @@ def _base_props(old_act, new_type):
         "userProperties": deepcopy(old_act.get("userProperties", []))
     }
 
-def convert_activity_list(activities):
+def convert_activity_list(activities, pipeline_props=None):
     if not isinstance(activities, list):
         return []
     converted = []
@@ -404,44 +513,50 @@ def convert_activity_list(activities):
         elif atype == "ExecutePipeline":
             new_act = convert_invoke_pipeline(act)
         elif atype == "Copy":
-            new_act = convert_copy(act)
+            new_act = convert_copy(act, pipeline_props)
         elif atype == "Lookup":
             new_act = convert_lookup(act)
+        elif atype == "GetMetadata":
+            new_act = convert_get_metadata(act, pipeline_props)
+        elif atype == "SetVariable":
+            new_act = convert_set_variable(act)
+        elif atype == "ForEach":
+            new_act = convert_for_each(act, pipeline_props)
         else:
             new_act = deepcopy(act)
-            # Remove ADF-only linkedServiceName
             if "linkedServiceName" in new_act:
                 del new_act["linkedServiceName"]
 
-        # Recurse into nested activity containers
+        # Recurse into nested containers inside typeProperties
         tp = new_act.get("typeProperties")
         if isinstance(tp, dict):
             if isinstance(tp.get("ifTrueActivities"), list):
-                tp["ifTrueActivities"] = convert_activity_list(tp["ifTrueActivities"])
+                tp["ifTrueActivities"] = convert_activity_list(tp["ifTrueActivities"], pipeline_props)
             if isinstance(tp.get("ifFalseActivities"), list):
-                tp["ifFalseActivities"] = convert_activity_list(tp["ifFalseActivities"])
+                tp["ifFalseActivities"] = convert_activity_list(tp["ifFalseActivities"], pipeline_props)
             if isinstance(tp.get("activities"), list):
-                tp["activities"] = convert_activity_list(tp["activities"])
+                tp["activities"] = convert_activity_list(tp["activities"], pipeline_props)
             if isinstance(tp.get("cases"), list):
                 tp["cases"] = [
-                    {**case, "activities": convert_activity_list(case.get("activities", []))}
+                    {**case, "activities": convert_activity_list(case.get("activities", []), pipeline_props)}
                     for case in tp["cases"]
                 ]
             if isinstance(tp.get("defaultActivities"), list):
-                tp["defaultActivities"] = convert_activity_list(tp["defaultActivities"])
+                tp["defaultActivities"] = convert_activity_list(tp["defaultActivities"], pipeline_props)
 
         converted.append(new_act)
     return converted
 
 def process_pipeline(source_json):
+    props = deepcopy(source_json.get("properties", {}))
     target = {
         "name": source_json.get("name", "ConvertedPipeline"),
         "objectId": str(uuid.uuid4()),
-        "properties": deepcopy(source_json.get("properties", {}))
+        "properties": props
     }
-    activities = target["properties"].get("activities")
+    activities = props.get("activities")
     if isinstance(activities, list):
-        target["properties"]["activities"] = convert_activity_list(activities)
+        target["properties"]["activities"] = convert_activity_list(activities, props)
     else:
         target["properties"]["activities"] = []
     return target
